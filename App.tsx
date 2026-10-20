@@ -833,6 +833,25 @@ export default function App() {
         <Text style={styles.statusText}>{statusMessage}</Text>
       </View>
 
+      <View style={styles.bottomNav} accessibilityRole="tablist">
+        <TouchableOpacity
+          style={[styles.navButton, activePage === 'workflow' && styles.navButtonActive]}
+          accessibilityRole="tab"
+          accessibilityState={{ selected: activePage === 'workflow' }}
+          onPress={() => setActivePage('workflow')}
+        >
+          <Text style={[styles.navText, activePage === 'workflow' && styles.navTextActive]}>Workflow</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.navButton, activePage === 'uploads' && styles.navButtonActive]}
+          accessibilityRole="tab"
+          accessibilityState={{ selected: activePage === 'uploads' }}
+          onPress={() => setActivePage('uploads')}
+        >
+          <Text style={[styles.navText, activePage === 'uploads' && styles.navTextActive]}>Upload media</Text>
+        </TouchableOpacity>
+      </View>
+
       <ScrollView contentContainerStyle={styles.content}>
         {activePage === 'uploads' ? renderMediaUploadPage() : (
           <>
@@ -846,14 +865,6 @@ export default function App() {
           </>
         )}
       </ScrollView>
-      <View style={styles.bottomNav}>
-        <TouchableOpacity style={styles.navButton} onPress={() => setActivePage('workflow')}>
-          <Text style={[styles.navText, activePage === 'workflow' && styles.navTextActive]}>Workflow</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.navButton} onPress={() => setActivePage('uploads')}>
-          <Text style={[styles.navText, activePage === 'uploads' && styles.navTextActive]}>Upload media</Text>
-        </TouchableOpacity>
-      </View>
     </View>
   );
 }
@@ -1167,8 +1178,9 @@ const styles = StyleSheet.create({
   videoPreviewText: { color: '#ffffff', fontSize: 14, fontWeight: '700' },
   mediaName: { color: '#263a2f', fontSize: 12, marginTop: 7 },
   removeMedia: { color: '#9b3e32', fontSize: 12, fontWeight: '700', paddingVertical: 5 },
-  bottomNav: { flexDirection: 'row', borderTopWidth: 1, borderColor: '#d1dfd6', backgroundColor: '#ffffff', paddingHorizontal: 18, paddingVertical: 12 },
-  navButton: { flex: 1, alignItems: 'center', paddingVertical: 7 },
+  bottomNav: { flexDirection: 'row', borderBottomWidth: 1, borderColor: '#d1dfd6', backgroundColor: '#ffffff', paddingHorizontal: 18, paddingVertical: 8 },
+  navButton: { flex: 1, minHeight: 44, alignItems: 'center', justifyContent: 'center', paddingVertical: 7, borderRadius: 8 },
+  navButtonActive: { backgroundColor: '#e4efe8' },
   navText: { color: '#52645a', fontSize: 13, fontWeight: '600' },
   navTextActive: { color: '#247349', fontWeight: '800' },
 });
