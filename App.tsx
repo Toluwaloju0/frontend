@@ -121,7 +121,7 @@ type TrendInsight = {
 const API_BASE_URL = (process.env.EXPO_PUBLIC_API_BASE_URL || '').trim().replace(/\/+$/, '');
 const apiUrl = (path: string) => {
   if (!API_BASE_URL) {
-    throw new Error('Backend URL is not configured. Set EXPO_PUBLIC_API_BASE_URL in frontend/.env and rebuild the app.');
+    throw new Error('Backend URL is missing from this app build. Check EXPO_PUBLIC_API_BASE_URL in frontend/.env and rebuild the app.');
   }
   return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
 };
