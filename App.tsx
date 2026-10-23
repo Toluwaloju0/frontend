@@ -4,6 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 import {
   Alert,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -11,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { Image } from 'react-native';
 
 type PlatformKey = 'instagram' | 'tiktok' | 'snapchat' | 'youtube';
@@ -32,7 +34,42 @@ type ContentAssetForm = {
   description: string;
 };
 
-type ContentAssetRecord = ContentAssetForm & { id: string };
+type ContentAssetRecord = {
+  id: string;
+  asset_type: 'image' | 'video' | 'text';
+  title: string | null;
+  source_text: string | null;
+  description: string | null;
+  content_generation_status: 'pending content generation' | 'processing content generation' | 'completed content generation';
+};
+
+type GeneratedContentType = 'text' | 'image' | 'video';
+
+type GeneratedContentRecord = {
+  id: string;
+  business_profile_id: string;
+  content_type: GeneratedContentType;
+  title: string;
+  body: string;
+  source_analysis_ids: string[];
+  created_at: string;
+};
+
+type ContentGenerationJobRecord = {
+  job_id: string;
+  status: 'pending' | 'processing' | 'complete' | 'failed';
+  content_type: GeneratedContentType;
+  items: GeneratedContentRecord[];
+  error_message?: string | null;
+};
+
+type SocialAccountRecord = {
+  id: string;
+  business_profile_id: string;
+  platform: PlatformKey;
+  account_name: string;
+  status: string;
+};
 
 type PickedMedia = {
   uri: string;
@@ -81,8 +118,15 @@ type TrendInsight = {
   live_trend_data_available: boolean;
 };
 
-const API_BASE_URL =
-  (typeof process !== 'undefined' && process.env.EXPO_PUBLIC_API_BASE_URL) || 'http://140.238.91.204';
+const API_BASE_URL = (process.env.EXPO_PUBLIC_API_BASE_URL || '').trim().replace(/\/+$/, '');
+const apiUrl = (path: string) => {
+  if (!API_BASE_URL) {
+    throw new Error('Backend URL is not configured. Set EXPO_PUBLIC_API_BASE_URL in frontend/.env and rebuild the app.');
+  }
+  return `${API_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+};
+const mediaAssetUploadUrl = (profileId: string) =>
+  apiUrl(`/api/v1/business-profiles/${encodeURIComponent(profileId)}/media-assets`);
 const BUSINESS_PROFILE_CACHE_KEY = 'localbiz.business-profile.v1';
 const LOCAL_USER_ID_KEY = 'localbiz.user-id.v1';
 
@@ -103,6 +147,12 @@ const TREND_FORMAT_OPTIONS = [
   { key: 'behind_scenes', label: 'Behind the scenes' },
   { key: 'customer_story', label: 'Customer story' },
   { key: 'offer_spotlight', label: 'Offer spotlight' },
+];
+
+const CONTENT_TYPE_OPTIONS: Array<{ key: GeneratedContentType; label: string; description: string }> = [
+  { key: 'text', label: 'Text post', description: 'Ready-to-publish post copy' },
+  { key: 'image', label: 'Image brief', description: 'Text brief for a future image generator' },
+  { key: 'video', label: 'Video brief', description: 'Text brief for a future video generator' },
 ];
 
 const defaultProfile: BusinessProfileForm = {
@@ -137,9 +187,17 @@ export default function App() {
   const [rankedAssets, setRankedAssets] = useState<RankedAsset[]>([]);
   const [trendInsight, setTrendInsight] = useState<TrendInsight | null>(null);
   const [statusMessage, setStatusMessage] = useState('Create your business profile to get started.');
-  const [activePage, setActivePage] = useState<'workflow' | 'uploads'>('workflow');
+  const [activePage, setActivePage] = useState<'workflow' | 'uploads' | 'create' | 'compose'>('workflow');
   const [pickedMedia, setPickedMedia] = useState<PickedMedia[]>([]);
   const [isUploadingMedia, setIsUploadingMedia] = useState(false);
+  const [generationType, setGenerationType] = useState<GeneratedContentType>('text');
+  const [generatedContent, setGeneratedContent] = useState<GeneratedContentRecord[]>([]);
+  const [generationJobs, setGenerationJobs] = useState<ContentGenerationJobRecord[]>([]);
+  const [isGeneratingContent, setIsGeneratingContent] = useState(false);
+  const [socialAccounts, setSocialAccounts] = useState<SocialAccountRecord[]>([]);
+  const [selectedSocialAccountId, setSelectedSocialAccountId] = useState<string | null>(null);
+  const [selectedGeneratedContent, setSelectedGeneratedContent] = useState<GeneratedContentRecord | null>(null);
+  const [isLoadingSocialAccounts, setIsLoadingSocialAccounts] = useState(false);
 
   const canContinue = useMemo(() => {
     const required = [
@@ -199,8 +257,9 @@ export default function App() {
         }
 
         let activeProfile: ProfileResult | null = null;
+        let syncError: string | null = null;
         try {
-          const createResponse = await fetch(`${API_BASE_URL}/api/v1/business-profile`, {
+          const createResponse = await fetch(apiUrl('/api/v1/business-profile'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ...cachedProfile, user_id: userId }),
@@ -215,9 +274,12 @@ export default function App() {
                 user_id: activeProfile.user_id,
               }),
             );
+          } else {
+            const errorBody = await createResponse.json().catch(() => null);
+            syncError = errorBody?.detail || `Backend returned HTTP ${createResponse.status}.`;
           }
         } catch (error) {
-          // Keep the cached profile usable for offline review.
+          syncError = error instanceof Error ? error.message : 'Network request failed.';
         }
 
         if (isMounted) {
@@ -230,7 +292,7 @@ export default function App() {
           setStatusMessage(
             activeProfile
               ? 'Saved business profile restored.'
-              : 'Saved business details restored offline. Reconnect to sync with the backend.',
+              : `Saved business details restored offline. Backend sync failed: ${syncError || 'unknown error'}`,
           );
           setStep(2);
         }
@@ -250,6 +312,87 @@ export default function App() {
       isMounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    const profileId = profileResult?.id;
+    if (!profileId || !/^[0-9a-f-]{36}$/i.test(profileId)) return;
+
+    let isMounted = true;
+    const restoreContentLibrary = async () => {
+      setIsLoadingSocialAccounts(true);
+      try {
+        const [assetsResult, generatedResult, jobsResult, accountsResult] = await Promise.allSettled([
+          fetch(apiUrl(`/api/v1/business-profiles/${profileId}/content-assets`)),
+          fetch(apiUrl(`/api/v1/business-profiles/${profileId}/generated-content`)),
+          fetch(apiUrl(`/api/v1/business-profiles/${profileId}/generated-content/jobs`)),
+          fetch(apiUrl(`/api/v1/business-profiles/${profileId}/social-accounts`)),
+        ]);
+
+        if (!isMounted) return;
+        if (assetsResult.status === 'fulfilled' && assetsResult.value.ok) {
+          const assets = await assetsResult.value.json();
+          if (Array.isArray(assets)) setAssetLibrary(assets as ContentAssetRecord[]);
+        }
+        if (generatedResult.status === 'fulfilled' && generatedResult.value.ok) {
+          const items = await generatedResult.value.json();
+          if (Array.isArray(items)) setGeneratedContent(items as GeneratedContentRecord[]);
+        }
+        if (jobsResult.status === 'fulfilled' && jobsResult.value.ok) {
+          const jobs = await jobsResult.value.json();
+          if (Array.isArray(jobs)) setGenerationJobs(jobs as ContentGenerationJobRecord[]);
+        }
+        if (accountsResult.status === 'fulfilled' && accountsResult.value.ok) {
+          const accounts = await accountsResult.value.json();
+          if (Array.isArray(accounts)) {
+            const connected = (accounts as SocialAccountRecord[]).filter((account) => account.status === 'connected');
+            setSocialAccounts(connected);
+            setSelectedSocialAccountId((current) => current ?? connected[0]?.id ?? null);
+          }
+        }
+      } catch {
+        // Keep the screen usable with the content already in local state.
+      } finally {
+        if (isMounted) setIsLoadingSocialAccounts(false);
+      }
+    };
+
+    void restoreContentLibrary();
+    return () => {
+      isMounted = false;
+    };
+  }, [profileResult?.id]);
+
+  useEffect(() => {
+    const profileId = profileResult?.id;
+    if (activePage !== 'create' || !profileId || !/^[0-9a-f-]{36}$/i.test(profileId)) return;
+    let isMounted = true;
+    const refreshStatuses = async () => {
+      const [assetsResult, generatedResult, jobsResult] = await Promise.allSettled([
+        fetch(apiUrl(`/api/v1/business-profiles/${profileId}/content-assets`)),
+        fetch(apiUrl(`/api/v1/business-profiles/${profileId}/generated-content`)),
+        fetch(apiUrl(`/api/v1/business-profiles/${profileId}/generated-content/jobs`)),
+      ]);
+      if (!isMounted) return;
+      if (assetsResult.status === 'fulfilled' && assetsResult.value.ok) {
+        const assets = await assetsResult.value.json();
+        if (Array.isArray(assets)) setAssetLibrary(assets as ContentAssetRecord[]);
+      }
+      if (generatedResult.status === 'fulfilled' && generatedResult.value.ok) {
+        const items = await generatedResult.value.json();
+        if (Array.isArray(items)) setGeneratedContent(items as GeneratedContentRecord[]);
+      }
+      if (jobsResult.status === 'fulfilled' && jobsResult.value.ok) {
+        const jobs = await jobsResult.value.json();
+        if (Array.isArray(jobs)) setGenerationJobs(jobs as ContentGenerationJobRecord[]);
+      }
+    };
+    void refreshStatuses();
+    const timer = setInterval(() => void refreshStatuses(), 10000);
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
+  }, [activePage, profileResult?.id]);
 
   const togglePlatform = (platform: PlatformKey) => {
     setSelectedPlatforms((current) =>
@@ -284,14 +427,15 @@ export default function App() {
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/business-profile`, {
+      const response = await fetch(apiUrl('/api/v1/business-profile'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...profile, user_id: userId }),
       });
 
       if (!response.ok) {
-        throw new Error('Profile could not be saved.');
+        const errorBody = await response.json().catch(() => null);
+        throw new Error(errorBody?.detail || `Backend returned HTTP ${response.status}.`);
       }
 
       const savedProfile = (await response.json()) as ProfileResult;
@@ -310,7 +454,8 @@ export default function App() {
         niche: profile.niche,
       };
       setProfileResult(fallbackProfile);
-      setStatusMessage('Offline demo mode: profile stored locally for this session.');
+      const reason = error instanceof Error ? error.message : 'Network request failed.';
+      setStatusMessage(`Offline demo mode: backend profile save failed (${reason}).`);
       setStep(2);
     } finally {
       setIsSubmitting(false);
@@ -324,7 +469,7 @@ export default function App() {
     }
 
     try {
-      await fetch(`${API_BASE_URL}/api/v1/business-profiles/${profileResult.id}/social-accounts`, {
+      await fetch(apiUrl(`/api/v1/business-profiles/${profileResult.id}/social-accounts`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -349,7 +494,7 @@ export default function App() {
     }
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/v1/business-profiles/${profileResult.id}/content-assets`, {
+      const response = await fetch(apiUrl(`/api/v1/business-profiles/${profileResult.id}/content-assets`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -380,7 +525,7 @@ export default function App() {
 
     try {
       if (!demoMode) {
-        const response = await fetch(`${API_BASE_URL}/api/v1/content-suggestions/generate`, {
+        const response = await fetch(apiUrl('/api/v1/content-suggestions/generate'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -523,21 +668,42 @@ export default function App() {
     setIsUploadingMedia(true);
     try {
       for (const media of pickedMedia) {
-        const formData = new FormData();
-        formData.append('file', {
-          uri: media.uri,
-          name: media.name,
-          type: media.mimeType,
-        } as unknown as Blob);
-        const response = await fetch(
-          `${API_BASE_URL}/api/v1/business-profiles/${profileResult.id}/media-assets`,
-          { method: 'POST', body: formData },
-        );
-        if (!response.ok) {
-          const errorBody = await response.json().catch(() => null);
-          throw new Error(errorBody?.detail || `Upload failed for ${media.name}`);
+        const uploadUrl = mediaAssetUploadUrl(profileResult.id);
+        let response: Awaited<ReturnType<typeof FileSystem.uploadAsync>>;
+        try {
+          response = await FileSystem.uploadAsync(
+            uploadUrl,
+            media.uri,
+            {
+              fieldName: 'file',
+              httpMethod: 'POST',
+              mimeType: media.mimeType,
+              uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+            },
+          );
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'Network request failed';
+          throw new Error(`Could not reach ${uploadUrl}: ${reason}`);
         }
-        const savedAsset = await response.json() as ContentAssetRecord;
+        let responseBody: any = null;
+        try {
+          responseBody = JSON.parse(response.body);
+        } catch {
+          // Keep the status-based fallback below for non-JSON error responses.
+        }
+        if (response.status < 200 || response.status >= 300) {
+          const errorBody = responseBody;
+          const detail = errorBody?.detail || response.body?.trim().slice(0, 300);
+          throw new Error(
+            detail
+              ? `Upload endpoint returned HTTP ${response.status}: ${detail}`
+              : `Upload endpoint returned HTTP ${response.status} for ${media.name}`,
+          );
+        }
+        const savedAsset = responseBody as ContentAssetRecord;
+        if (!savedAsset?.id) {
+          throw new Error(`Upload response was invalid for ${media.name}`);
+        }
         setAssetLibrary((current) => [savedAsset, ...current]);
         setSelectedAssetIds((current) => [...current, savedAsset.id]);
       }
@@ -550,6 +716,137 @@ export default function App() {
       Alert.alert('Upload failed', message);
     } finally {
       setIsUploadingMedia(false);
+    }
+  };
+
+  const generateNewContent = async () => {
+    if (!profileResult || !/^[0-9a-f-]{36}$/i.test(profileResult.id)) {
+      Alert.alert('Business profile needed', 'Save or reconnect your business profile before generating content.');
+      return;
+    }
+
+    setIsGeneratingContent(true);
+    setStatusMessage('Using your latest analyzed uploads to create three ideas...');
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/business-profiles/${profileResult.id}/generated-content/generate`),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content_type: generationType }),
+        },
+      );
+      const queued = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(queued?.detail || `Content generation failed (HTTP ${response.status}).`);
+      }
+
+      if (!queued?.job_id) {
+        throw new Error('The server did not return a content generation job ID.');
+      }
+      setGenerationJobs((current) => [
+        { job_id: queued.job_id, status: queued.status || 'pending', content_type: generationType, items: [] },
+        ...current.filter((job) => job.job_id !== queued.job_id),
+      ]);
+
+      let finishedItems: GeneratedContentRecord[] | null = null;
+      for (let attempt = 0; attempt < 1200; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        const pollResponse = await fetch(
+          apiUrl(`/api/v1/business-profiles/${profileResult.id}/generated-content/jobs/${queued.job_id}`),
+        );
+        const job = await pollResponse.json().catch(() => null);
+        if (!pollResponse.ok) {
+          throw new Error(job?.detail || `Could not check generation status (HTTP ${pollResponse.status}).`);
+        }
+        if (job?.status) {
+          setGenerationJobs((current) => [
+            { ...job, content_type: generationType },
+            ...current.filter((entry) => entry.job_id !== queued.job_id),
+          ]);
+        }
+        if (job?.status === 'failed') {
+          throw new Error(job.error_message || 'The content generation worker could not complete this request.');
+        }
+        if (job?.status === 'complete') {
+          finishedItems = Array.isArray(job.items) ? job.items as GeneratedContentRecord[] : [];
+          break;
+        }
+        setStatusMessage(
+          job?.status === 'processing'
+            ? 'Gemma is creating your three ideas. This may take a few minutes...'
+            : 'Your content request is queued for Gemma...',
+        );
+      }
+      const completedItems = finishedItems;
+      if (!completedItems || completedItems.length !== 3) {
+        throw new Error('Generation is still running. Your request remains queued; check the content library again shortly.');
+      }
+      setGeneratedContent((current) => [...completedItems, ...current]);
+      setGenerationJobs((current) => current.map((job) =>
+        job.job_id === queued.job_id ? { ...job, status: 'complete', items: completedItems } : job,
+      ));
+      setStatusMessage(`Three ${generationType} content ideas were saved to your content library.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not generate content.';
+      setStatusMessage(message);
+      Alert.alert('Content generation failed', message);
+    } finally {
+      setIsGeneratingContent(false);
+    }
+  };
+
+  const openContentComposer = async (item: GeneratedContentRecord) => {
+    setSelectedGeneratedContent(item);
+    setSelectedSocialAccountId((current) =>
+      socialAccounts.some((account) => account.id === current)
+        ? current
+        : socialAccounts[0]?.id ?? null,
+    );
+    setActivePage('compose');
+    const profileId = profileResult?.id;
+    if (!profileId || !/^[0-9a-f-]{36}$/i.test(profileId)) return;
+
+    setIsLoadingSocialAccounts(true);
+    try {
+      const response = await fetch(apiUrl(`/api/v1/business-profiles/${profileId}/social-accounts`));
+      if (!response.ok) return;
+      const accounts = await response.json();
+      if (!Array.isArray(accounts)) return;
+      const connected = (accounts as SocialAccountRecord[]).filter((account) => account.status === 'connected');
+      setSocialAccounts(connected);
+      setSelectedSocialAccountId((current) =>
+        connected.some((account) => account.id === current) ? current : connected[0]?.id ?? null,
+      );
+    } catch {
+      // Keep the previously loaded connected account list visible if refresh fails.
+    } finally {
+      setIsLoadingSocialAccounts(false);
+    }
+  };
+
+  const shareSelectedContent = async () => {
+    if (!selectedGeneratedContent) return;
+    const selectedAccount = socialAccounts.find((account) => account.id === selectedSocialAccountId);
+    if (!selectedAccount) {
+      Alert.alert('Choose an account', 'Select one of your connected social accounts first.');
+      return;
+    }
+
+    try {
+      await Share.share(
+        {
+          title: selectedGeneratedContent.title,
+          message: `${selectedGeneratedContent.title}\n\n${selectedGeneratedContent.body}`,
+        },
+        { dialogTitle: `Share to ${selectedAccount.platform}` },
+      );
+      setStatusMessage(
+        `Share options opened for ${selectedAccount.platform}. Finish and confirm the post in that social app.`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not open the share options.';
+      Alert.alert('Could not share post text', message);
     }
   };
 
@@ -825,6 +1122,163 @@ export default function App() {
     </View>
   );
 
+  const renderCreateContentPage = () => (
+    <View>
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Create content</Text>
+        <Text style={styles.helperText}>
+          Choose a content type. Gemma uses your business profile and up to the five latest completed upload analyses.
+          Image and video selections return text briefs for now; media rendering will be added later.
+        </Text>
+        {CONTENT_TYPE_OPTIONS.map((option) => (
+          <TouchableOpacity
+            key={option.key}
+            style={[styles.platformRow, generationType === option.key && styles.platformSelected]}
+            accessibilityRole="radio"
+            accessibilityState={{ selected: generationType === option.key }}
+            onPress={() => setGenerationType(option.key)}
+          >
+            <View style={styles.assetCopy}>
+              <Text style={styles.platformText}>{option.label}</Text>
+              <Text style={styles.assetMeta}>{option.description}</Text>
+            </View>
+            <Text style={styles.assetCheck}>{generationType === option.key ? '✓' : '○'}</Text>
+          </TouchableOpacity>
+        ))}
+        <TouchableOpacity
+          style={[styles.primaryButton, (isGeneratingContent || !profileResult) && styles.disabledButton]}
+          disabled={isGeneratingContent || !profileResult}
+          onPress={generateNewContent}
+        >
+          <Text style={styles.primaryButtonText}>
+            {isGeneratingContent ? 'Generating...' : 'Generate three ideas'}
+          </Text>
+        </TouchableOpacity>
+        <Text style={styles.helperText}>
+          Generation requires at least one completed upload analysis. New ideas are saved automatically.
+        </Text>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Your saved source library</Text>
+        {assetLibrary.length === 0 ? (
+          <Text style={styles.emptyState}>No uploaded or saved source content found for this profile yet.</Text>
+        ) : assetLibrary.map((libraryAsset) => (
+          <View key={libraryAsset.id} style={styles.rankedAssetRow}>
+            <View style={styles.assetCopy}>
+              <Text style={styles.assetTitle}>{libraryAsset.title || 'Untitled source'}</Text>
+              <Text style={styles.assetMeta}>{libraryAsset.asset_type.toUpperCase()}</Text>
+              <Text style={styles.suggestionMeta}>{libraryAsset.content_generation_status || 'pending content generation'}</Text>
+              {!!libraryAsset.description && <Text style={styles.insightText}>{libraryAsset.description}</Text>}
+            </View>
+          </View>
+        ))}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Content generation status</Text>
+        {generationJobs.length === 0 ? (
+          <Text style={styles.emptyState}>No content generation requests yet.</Text>
+        ) : generationJobs.map((job) => {
+          const statusLabel = job.status === 'complete'
+            ? 'Completed content generation'
+            : job.status === 'processing'
+              ? 'Processing content generation'
+              : job.status === 'failed'
+                ? 'Content generation failed'
+                : 'Pending content generation';
+          return (
+            <View key={job.job_id} style={styles.rankedAssetRow}>
+              <View style={styles.assetCopy}>
+                <Text style={styles.assetTitle}>{job.content_type.toUpperCase()} content request</Text>
+                <Text style={styles.suggestionMeta}>{statusLabel}</Text>
+                {!!job.error_message && <Text style={styles.insightText}>{job.error_message}</Text>}
+              </View>
+            </View>
+          );
+        })}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Generated content library</Text>
+        {generatedContent.length === 0 ? (
+          <Text style={styles.emptyState}>Generated text and media briefs will appear here.</Text>
+        ) : generatedContent.map((item) => (
+          <TouchableOpacity
+            key={item.id}
+            style={styles.suggestionCard}
+            accessibilityRole="button"
+            accessibilityLabel={`Review and share ${item.title}`}
+            onPress={() => openContentComposer(item)}
+          >
+            <Text style={styles.suggestionTitle}>{item.title}</Text>
+            <Text style={styles.suggestionMeta}>{item.content_type.toUpperCase()} · {new Date(item.created_at).toLocaleDateString()}</Text>
+            <Text style={styles.suggestionMeta}>Completed content generation</Text>
+            <Text style={styles.suggestionText}>{item.body}</Text>
+            <Text style={styles.editProfileText}>Tap to review and share</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </View>
+  );
+
+  const renderContentComposer = () => (
+    <View style={styles.card}>
+      <TouchableOpacity onPress={() => setActivePage('create')}>
+        <Text style={styles.editProfileText}>‹ Back to content library</Text>
+      </TouchableOpacity>
+      <Text style={styles.sectionTitle}>Review post</Text>
+      {!selectedGeneratedContent ? (
+        <Text style={styles.emptyState}>Choose an item from your generated content library.</Text>
+      ) : (
+        <>
+          <Text style={styles.suggestionMeta}>{selectedGeneratedContent.content_type.toUpperCase()} CONTENT</Text>
+          <Text style={styles.suggestionTitle}>{selectedGeneratedContent.title}</Text>
+          <View style={styles.suggestionCard}>
+            <Text style={styles.suggestionText}>{selectedGeneratedContent.body}</Text>
+          </View>
+
+          <Text style={styles.sectionTitle}>Choose a connected account</Text>
+          {isLoadingSocialAccounts ? (
+            <Text style={styles.emptyState}>Loading your connected accounts...</Text>
+          ) : socialAccounts.length === 0 ? (
+            <View>
+              <Text style={styles.emptyState}>No connected social accounts were found for this business profile.</Text>
+              <TouchableOpacity style={styles.secondaryButton} onPress={() => setActivePage('workflow')}>
+                <Text style={styles.secondaryButtonText}>Go to platform connections</Text>
+              </TouchableOpacity>
+            </View>
+          ) : socialAccounts.map((account) => (
+            <TouchableOpacity
+              key={account.id}
+              style={[styles.platformRow, selectedSocialAccountId === account.id && styles.platformSelected]}
+              accessibilityRole="radio"
+              accessibilityState={{ selected: selectedSocialAccountId === account.id }}
+              onPress={() => setSelectedSocialAccountId(account.id)}
+            >
+              <View style={styles.assetCopy}>
+                <Text style={styles.platformText}>{account.platform}</Text>
+                <Text style={styles.assetMeta}>{account.account_name}</Text>
+              </View>
+              <Text style={styles.assetCheck}>{selectedSocialAccountId === account.id ? '✓' : '○'}</Text>
+            </TouchableOpacity>
+          ))}
+
+          <Text style={styles.helperText}>
+            Share options open on your phone. Select the social app and finish the post there; this app does not publish directly to social platforms yet.
+          </Text>
+          <TouchableOpacity
+            style={[styles.primaryButton, (!selectedSocialAccountId || socialAccounts.length === 0) && styles.disabledButton]}
+            disabled={!selectedSocialAccountId || socialAccounts.length === 0}
+            onPress={shareSelectedContent}
+          >
+            <Text style={styles.primaryButtonText}>Open share options</Text>
+          </TouchableOpacity>
+        </>
+      )}
+    </View>
+  );
+
   return (
     <View style={styles.screen}>
       <StatusBar style="dark" />
@@ -850,10 +1304,24 @@ export default function App() {
         >
           <Text style={[styles.navText, activePage === 'uploads' && styles.navTextActive]}>Upload media</Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.navButton, (activePage === 'create' || activePage === 'compose') && styles.navButtonActive]}
+          accessibilityRole="tab"
+          accessibilityState={{ selected: activePage === 'create' }}
+          onPress={() => setActivePage('create')}
+        >
+          <Text style={[styles.navText, (activePage === 'create' || activePage === 'compose') && styles.navTextActive]}>Create content</Text>
+        </TouchableOpacity>
       </View>
 
       <ScrollView contentContainerStyle={styles.content}>
-        {activePage === 'uploads' ? renderMediaUploadPage() : (
+        {activePage === 'uploads'
+          ? renderMediaUploadPage()
+          : activePage === 'compose'
+            ? renderContentComposer()
+            : activePage === 'create'
+              ? renderCreateContentPage()
+              : (
           <>
             {isRestoringProfile ? (
               <View style={styles.card}>
